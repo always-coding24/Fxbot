@@ -16,8 +16,9 @@ class SMCBot:
             h4_data: A list of 4-hour candlestick objects.
             h1_data: A list of 1-hour candlestick objects.
         """
-        self.h4_data = sorted(h4_data, key=lambda x: x['time'])
-        self.h1_data = sorted(h1_data, key=lambda x: x['time'])
+        # Ensure data is sorted by time, as analysis depends on sequence.
+        self.h4_data = sorted(h4_data, key=lambda x: x.get('time', 0))
+        self.h1_data = sorted(h1_data, key=lambda x: x.get('time', 0))
         self.mitigated_h4_pois = set()
         self.mitigated_h1_pois = set()
 
@@ -28,8 +29,8 @@ class SMCBot:
         Returns:
             A dictionary with the trade action or reason for not trading.
         """
-        if len(self.h4_data) < 5 or len(self.h1_data) < 5:
-            return self._format_no_trade("INVALID_STRUCTURE", "Insufficient data.")
+        if len(self.h4_data) < 5 or len(self.h1_data) < 4:
+            return self._format_no_trade("INVALID_STRUCTURE", "Insufficient data for analysis.")
 
         # 1. Determine 4H Directional Bias
         bias_analysis = self._get_4h_bias()
@@ -43,7 +44,9 @@ class SMCBot:
         if not self._is_mitigated(h4_poi, self.h4_data):
             return self._format_no_trade("WAITING_FOR_4H_POI_MITIGATION", "Waiting for price to tap the 4H POI.")
         
-        self.mitigated_h4_pois.add(h4_poi['time'])
+        # Add the timestamp of the mitigated POI to the set
+        if 'time' in h4_poi:
+             self.mitigated_h4_pois.add(h4_poi['time'])
 
         # 3. Analyze 1H for Entry
         entry_analysis = self._get_1h_entry(bias)
@@ -56,7 +59,8 @@ class SMCBot:
         if not self._is_mitigated(h1_poi, self.h1_data):
              return self._format_no_trade("WAITING_FOR_1H_POI_MITIGATION", "Waiting for price to tap the 1H POI for entry.")
         
-        self.mitigated_h1_pois.add(h1_poi['time'])
+        if 'time' in h1_poi:
+            self.mitigated_h1_pois.add(h1_poi['time'])
 
         # 5. Execute Trade
         return self._prepare_trade(bias, h1_poi)
@@ -146,22 +150,27 @@ class SMCBot:
         return {"error": "No 1H entry setup found.", "reason": "NO_SETUP"}
 
     def _get_swing_points(self, data: List[Dict]) -> Dict:
-        """Identifies swing highs and lows from candlestick data."""
+        """Identifies swing highs and lows from candlestick data using a more robust method."""
         highs, lows = [], []
         # Need at least 3 candles to form a swing point
+        if len(data) < 3:
+            return {"highs": highs, "lows": lows}
+            
         for i in range(1, len(data) - 1):
-            # Swing High
-            if data[i]['high'] > data[i-1]['high'] and data[i]['high'] > data[i+1]['high']:
+            # Swing High: A peak. It must be strictly higher than the candle that follows it,
+            # and higher than or equal to the candle before it. This handles plateaus.
+            if data[i]['high'] >= data[i-1]['high'] and data[i]['high'] > data[i+1]['high']:
                 highs.append(data[i])
-            # Swing Low
-            if data[i]['low'] < data[i-1]['low'] and data[i]['low'] < data[i+1]['low']:
+            
+            # Swing Low: A trough. It must be strictly lower than the candle that follows it,
+            # and lower than or equal to the candle before it. This handles flat bottoms.
+            if data[i]['low'] <= data[i-1]['low'] and data[i]['low'] < data[i+1]['low']:
                 lows.append(data[i])
         return {"highs": highs, "lows": lows}
 
+
     def _find_liquidity_sweep(self, swings: List[Dict], current_candle: Dict, side: str, is_mini: bool = False) -> Optional[Dict]:
         """Finds the most recent liquidity sweep."""
-        # For simplicity, we check if the current candle's low/high has taken out the most recent swing point.
-        # A more complex implementation would check for significant sweeps.
         if not swings:
             return None
         
@@ -185,26 +194,20 @@ class SMCBot:
 
     def _find_poi_after_mss(self, mss_point: Dict, data: List[Dict], direction: str, is_1h: bool = False) -> Optional[Dict]:
         """Finds the closest Order Block or Breaker Block after an MSS."""
-        # This is a simplified search. A real implementation would be more nuanced.
-        # We look for inducement patterns like FVGs first.
-        
         search_range = [c for c in data if c['time'] > mss_point['time']]
+        if not search_range:
+            return None
 
-        # Find FVGs as inducement
         fvgs = self._find_fvgs(search_range, direction)
-        
-        # Find Order Blocks near inducement
         order_blocks = self._find_order_blocks(search_range, direction)
 
         # Select the best POI (closest to current price, below/above inducement)
-        # For now, we take the most recent valid OB.
-        valid_pois = [ob for ob in order_blocks if (not is_1h and ob['time'] not in self.mitigated_h4_pois) or (is_1h and ob['time'] not in self.mitigated_h1_pois)]
+        mitigated_pois = self.mitigated_h1_pois if is_1h else self.mitigated_h4_pois
+        valid_pois = [ob for ob in order_blocks if ob.get('time') not in mitigated_pois]
         
         if not valid_pois:
             return None
 
-        # A simple check: POI must not be touched by inducement creating candles
-        # If there are FVGs, the POI should ideally be beyond the FVG from the MSS point.
         if fvgs:
             last_fvg = fvgs[-1]
             if direction == "bullish": # POI should be below FVG
@@ -215,12 +218,13 @@ class SMCBot:
             if potential_pois:
                 return min(potential_pois, key=lambda x: x['low']) if direction == "bullish" else max(potential_pois, key=lambda x: x['high'])
 
-        # If no FVG, take the most recent OB as a simplified POI
         return valid_pois[-1] if valid_pois else None
         
     def _find_fvgs(self, data: List[Dict], direction: str) -> List[Dict]:
         """Identifies Fair Value Gaps (FVGs)."""
         fvgs = []
+        if len(data) < 3:
+            return fvgs
         for i in range(len(data) - 2):
             c1, c2, c3 = data[i], data[i+1], data[i+2]
             if direction == "bullish" and c1['high'] < c3['low']:
@@ -232,29 +236,27 @@ class SMCBot:
     def _find_order_blocks(self, data: List[Dict], direction: str) -> List[Dict]:
         """Identifies Order Blocks."""
         order_blocks = []
-        # Simplified: Look for a strong move after an opposite candle
+        if len(data) < 2:
+            return order_blocks
         for i in range(1, len(data)):
             prev_candle = data[i-1]
             curr_candle = data[i]
 
             is_strong_move = abs(curr_candle['close'] - curr_candle['open']) > (abs(prev_candle['close'] - prev_candle['open']) * 1.5)
 
-            if direction == "bullish":
-                # Last down candle before strong up move
-                if prev_candle['close'] < prev_candle['open'] and curr_candle['close'] > curr_candle['open'] and is_strong_move:
-                    order_blocks.append(prev_candle)
+            if direction == "bullish" and prev_candle['close'] < prev_candle['open'] and curr_candle['close'] > curr_candle['open'] and is_strong_move:
+                order_blocks.append(prev_candle)
             
-            if direction == "bearish":
-                 # Last up candle before strong down move
-                if prev_candle['close'] > prev_candle['open'] and curr_candle['close'] < curr_candle['open'] and is_strong_move:
-                    order_blocks.append(prev_candle)
+            if direction == "bearish" and prev_candle['close'] > prev_candle['open'] and curr_candle['close'] < curr_candle['open'] and is_strong_move:
+                order_blocks.append(prev_candle)
 
         return order_blocks
 
     def _is_mitigated(self, poi: Dict, data: List[Dict]) -> bool:
         """Checks if a POI has been touched by price."""
-        # Check candles after the POI was formed
-        relevant_candles = [c for c in data if c['time'] > poi['time']]
+        if not poi or 'time' not in poi:
+             return False
+        relevant_candles = [c for c in data if c.get('time', 0) > poi['time']]
         for candle in relevant_candles:
             if candle['low'] <= poi['high'] and candle['high'] >= poi['low']:
                 return True
@@ -266,15 +268,13 @@ class SMCBot:
         
         if bias == "BUY":
             sl = poi['low'] * 0.999 # A bit below the low
-            # Find next swing high for TP
             swings = self._get_swing_points(self.h1_data)
-            potential_tps = [s for s in swings['highs'] if s['time'] > poi['time']]
+            potential_tps = [s for s in swings['highs'] if s.get('time', 0) > poi.get('time', 0)]
             tp = potential_tps[0]['high'] if potential_tps else entry_price * 1.01 # Fallback TP
         else: # SELL
             sl = poi['high'] * 1.001 # A bit above the high
-            # Find next swing low for TP
             swings = self._get_swing_points(self.h1_data)
-            potential_tps = [s for s in swings['lows'] if s['time'] > poi['time']]
+            potential_tps = [s for s in swings['lows'] if s.get('time', 0) > poi.get('time', 0)]
             tp = potential_tps[0]['low'] if potential_tps else entry_price * 0.99 # Fallback TP
             
         return {
@@ -287,7 +287,6 @@ class SMCBot:
 
     def _format_no_trade(self, reason_code: str, log_message: str) -> Dict:
         """Formats the JSON for a no-trade decision."""
-        # In a real system, you might log the log_message.
         return {"action": "don'ttaketrade", "reason": reason_code}
 
 
@@ -297,33 +296,28 @@ def main():
     Reads candlestick data from stdin, analyzes it, and prints the result to stdout.
     """
     try:
-        # Read the entire input from stdin
         input_data = sys.stdin.read()
         if not input_data:
-            print(json.dumps({"action": "don'ttaketrade", "reason": "INVALID_STRUCTURE", "details": "Input is empty"}), file=sys.stdout)
+            print(json.dumps({"action": "don'ttaketrade", "reason": "INVALID_STRUCTURE"}), file=sys.stdout)
             return
 
-        # Parse the JSON input
         data = json.loads(input_data)
         h4_data = data.get("h4_data")
         h1_data = data.get("h1_data")
         
-        if not h4_data or not h1_data:
-            print(json.dumps({"action": "don'ttaketrade", "reason": "INVALID_STRUCTURE", "details": "Missing h4_data or h1_data"}), file=sys.stdout)
+        if not isinstance(h4_data, list) or not isinstance(h1_data, list):
+            print(json.dumps({"action": "don'ttaketrade", "reason": "INVALID_STRUCTURE"}), file=sys.stdout)
             return
 
-        # Initialize and run the bot
         bot = SMCBot(h4_data, h1_data)
         result = bot.analyze()
         
-        # Print the result as a JSON string
         print(json.dumps(result), file=sys.stdout)
 
     except json.JSONDecodeError:
-        print(json.dumps({"action": "don'ttaketrade", "reason": "INVALID_STRUCTURE", "details": "Invalid JSON format"}), file=sys.stdout)
-    except Exception as e:
-        # Catch any other unexpected errors during analysis
-        print(json.dumps({"action": "don'ttaketrade", "reason": "INVALID_STRUCTURE", "details": str(e)}), file=sys.stdout)
+        print(json.dumps({"action": "don'ttaketrade", "reason": "INVALID_STRUCTURE"}), file=sys.stdout)
+    except Exception:
+        print(json.dumps({"action": "don'ttaketrade", "reason": "INVALID_STRUCTURE"}), file=sys.stdout)
 
 
 if __name__ == '__main__':
