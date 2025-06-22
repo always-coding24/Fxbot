@@ -199,120 +199,103 @@ class LiveTrader:
         candle['close'] = price
         candle['volume'] += qty
         return candle
+        
+    async def _handle_message(self, ws):
+        """Processes a single message from the websocket."""
+        async for message in ws:
+            trade = json.loads(message)
+            price = float(trade['p'])
+            qty = float(trade['q'])
+            timestamp = int(trade['T']) // 1000  # Use seconds for timestamp
+            
+            # --- Track Active Trade and Profit ---
+            if self.active_trade:
+                entry = self.active_trade['entry']
+                sl = self.active_trade['sl']
+                tp = self.active_trade['tp']
+                profit = 0
+                if self.active_trade['order_type'] == 'BUY':
+                    profit = ((price - entry) / entry) * 100
+                    if price <= sl: 
+                        print(f"\n❌ STOP LOSS HIT: P/L: {profit:.2f}%")
+                        self.active_trade = None
+                    elif price >= tp:
+                        print(f"\n🎯 TAKE PROFIT HIT: P/L: {profit:.2f}%")
+                        self.active_trade = None
+                else: # SELL
+                    profit = ((entry - price) / entry) * 100
+                    if price >= sl:
+                         print(f"\n❌ STOP LOSS HIT: P/L: {profit:.2f}%")
+                         self.active_trade = None
+                    elif price <= tp:
+                        print(f"\n🎯 TAKE PROFIT HIT: P/L: {profit:.2f}%")
+                        self.active_trade = None
+                
+                if self.active_trade: # Check if trade is still active before printing
+                    pnl_str = f"🟢 P/L: {profit:+.2f}%" if profit >= 0 else f"🔴 P/L: {profit:+.2f}%"
+                    print(f"\r🔔 IN TRADE [{self.active_trade['order_type']}]: Entry: {entry:.2f}, Current: {price:.2f}, SL: {sl:.2f}, TP: {tp:.2f} | {pnl_str}", end="")
+            
+            dt_object = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            current_h1_start_time = dt_object.replace(minute=0, second=0, microsecond=0)
+            current_h4_start_time = dt_object.replace(hour=(dt_object.hour // 4) * 4, minute=0, second=0, microsecond=0)
+            
+            if self.current_h1_candle is None:
+                self.current_h1_candle = self._update_candle(None, price, qty)
+                self.current_h1_candle['start_time'] = current_h1_start_time
+            
+            if current_h1_start_time > self.current_h1_candle['start_time']:
+                final_candle = {"time": int(self.current_h1_candle['start_time'].timestamp()), "open": self.current_h1_candle['open'], "high": self.current_h1_candle['high'], "low": self.current_h1_candle['low'], "close": self.current_h1_candle['close'], "volume": self.current_h1_candle['volume']}
+                self.h1_candles.append(final_candle)
+                print(f"\n🕯️ New 1H Candle Closed. Total 1H candles: {len(self.h1_candles)}. Analyzing...")
+                
+                self.current_h1_candle = self._update_candle(None, price, qty)
+                self.current_h1_candle['start_time'] = current_h1_start_time
+                
+                if not self.active_trade:
+                    analysis_result = self.smc_bot.analyze(self.h4_candles, self.h1_candles)
+                    if analysis_result['action'] == 'taketrade':
+                        self.active_trade = analysis_result
+                        print("\n" + "!"*80)
+                        print(f"🚨🚨🚨 TAKE TRADE SIGNAL 🚨🚨🚨")
+                        print(json.dumps(self.active_trade, indent=4))
+                        print("!"*80)
+                    else:
+                        print(f"📊 Analysis Result: {analysis_result['reason']} - {analysis_result['details']}")
+
+            if self.current_h4_candle is None:
+                self.current_h4_candle = self._update_candle(None, price, qty)
+                self.current_h4_candle['start_time'] = current_h4_start_time
+
+            if current_h4_start_time > self.current_h4_candle['start_time']:
+                final_candle = {"time": int(self.current_h4_candle['start_time'].timestamp()), "open": self.current_h4_candle['open'], "high": self.current_h4_candle['high'], "low": self.current_h4_candle['low'], "close": self.current_h4_candle['close'], "volume": self.current_h4_candle['volume']}
+                self.h4_candles.append(final_candle)
+                print(f"\n🕯️ New 4H Candle Closed. Total 4H candles: {len(self.h4_candles)}.")
+                self.current_h4_candle = self._update_candle(None, price, qty)
+                self.current_h4_candle['start_time'] = current_h4_start_time
+
+            self.current_h1_candle = self._update_candle(self.current_h1_candle, price, qty)
+            self.current_h4_candle = self._update_candle(self.current_h4_candle, price, qty)
 
     async def listen(self):
-        """Main loop to connect to WebSocket, process trades, and run analysis."""
-        print(f"Attempting to connect to {self.uri}...")
-        async with websockets.connect(self.uri) as ws:
-            print("✅ Connection successful. Waiting for live trade data...")
-            
-            async for message in ws:
-                trade = json.loads(message)
-                price = float(trade['p'])
-                qty = float(trade['q'])
-                timestamp = int(trade['T']) // 1000  # Use seconds for timestamp
-                
-                # --- Track Active Trade and Profit ---
-                if self.active_trade:
-                    entry = self.active_trade['entry']
-                    sl = self.active_trade['sl']
-                    tp = self.active_trade['tp']
-                    profit = 0
-                    if self.active_trade['order_type'] == 'BUY':
-                        profit = ((price - entry) / entry) * 100
-                        if price <= sl: 
-                            print(f"\n❌ STOP LOSS HIT: P/L: {profit:.2f}%")
-                            self.active_trade = None
-                        elif price >= tp:
-                            print(f"\n🎯 TAKE PROFIT HIT: P/L: {profit:.2f}%")
-                            self.active_trade = None
-                    else: # SELL
-                        profit = ((entry - price) / entry) * 100
-                        if price >= sl:
-                             print(f"\n❌ STOP LOSS HIT: P/L: {profit:.2f}%")
-                             self.active_trade = None
-                        elif price <= tp:
-                            print(f"\n🎯 TAKE PROFIT HIT: P/L: {profit:.2f}%")
-                            self.active_trade = None
-                    
-                    if self.active_trade: # Check if trade is still active before printing
-                        # Use carriage return to update the same line
-                        pnl_str = f"🟢 P/L: {profit:+.2f}%" if profit >= 0 else f"🔴 P/L: {profit:+.2f}%"
-                        print(f"\r🔔 IN TRADE [{self.active_trade['order_type']}]: Entry: {entry:.2f}, Current: {price:.2f}, SL: {sl:.2f}, TP: {tp:.2f} | {pnl_str}", end="")
-                    
-                # --- Candle Aggregation Logic ---
-                dt_object = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-                
-                # Define current candle start times
-                current_h1_start_time = dt_object.replace(minute=0, second=0, microsecond=0)
-                current_h4_start_time = dt_object.replace(hour=(dt_object.hour // 4) * 4, minute=0, second=0, microsecond=0)
-                
-                # --- Process 1-Hour Candles ---
-                if self.current_h1_candle is None: # First run
-                    self.current_h1_candle = self._update_candle(None, price, qty)
-                    self.current_h1_candle['start_time'] = current_h1_start_time
-                
-                if current_h1_start_time > self.current_h1_candle['start_time']:
-                    # Finalize the previous candle
-                    final_candle = {
-                        "time": int(self.current_h1_candle['start_time'].timestamp()),
-                        "open": self.current_h1_candle['open'],
-                        "high": self.current_h1_candle['high'],
-                        "low": self.current_h1_candle['low'],
-                        "close": self.current_h1_candle['close'],
-                        "volume": self.current_h1_candle['volume']
-                    }
-                    self.h1_candles.append(final_candle)
-                    print(f"\n🕯️ New 1H Candle Closed. Total 1H candles: {len(self.h1_candles)}. Analyzing...")
-                    
-                    # Start new candle
-                    self.current_h1_candle = self._update_candle(None, price, qty)
-                    self.current_h1_candle['start_time'] = current_h1_start_time
-                    
-                    # --- RUN ANALYSIS ---
-                    if not self.active_trade: # Only analyze if not already in a trade
-                        analysis_result = self.smc_bot.analyze(self.h4_candles, self.h1_candles)
-                        if analysis_result['action'] == 'taketrade':
-                            self.active_trade = analysis_result
-                            print("\n" + "!"*80)
-                            print(f"🚨🚨🚨 TAKE TRADE SIGNAL 🚨🚨🚨")
-                            print(json.dumps(self.active_trade, indent=4))
-                            print("!"*80)
-                        else:
-                            print(f"📊 Analysis Result: {analysis_result['reason']} - {analysis_result['details']}")
-
-                # --- Process 4-Hour Candles ---
-                if self.current_h4_candle is None: # First run
-                    self.current_h4_candle = self._update_candle(None, price, qty)
-                    self.current_h4_candle['start_time'] = current_h4_start_time
-
-                if current_h4_start_time > self.current_h4_candle['start_time']:
-                    final_candle = {
-                        "time": int(self.current_h4_candle['start_time'].timestamp()),
-                        "open": self.current_h4_candle['open'],
-                        "high": self.current_h4_candle['high'],
-                        "low": self.current_h4_candle['low'],
-                        "close": self.current_h4_candle['close'],
-                        "volume": self.current_h4_candle['volume']
-                    }
-                    self.h4_candles.append(final_candle)
-                    print(f"\n🕯️ New 4H Candle Closed. Total 4H candles: {len(self.h4_candles)}.")
-                    self.current_h4_candle = self._update_candle(None, price, qty)
-                    self.current_h4_candle['start_time'] = current_h4_start_time
-
-                # Update current candles with every trade
-                self.current_h1_candle = self._update_candle(self.current_h1_candle, price, qty)
-                self.current_h4_candle = self._update_candle(self.current_h4_candle, price, qty)
+        """Main loop to connect to WebSocket, process trades, and handle reconnections."""
+        while True:
+            try:
+                # Add ping_interval to keep the connection alive
+                async with websockets.connect(self.uri, ping_interval=20, ping_timeout=20) as ws:
+                    print("✅ Connection successful. Waiting for live trade data...")
+                    await self._handle_message(ws)
+            except websockets.exceptions.ConnectionClosed:
+                print("Connection closed. Reconnecting in 10 seconds...")
+                await asyncio.sleep(10)
+            except Exception as e:
+                print(f"An error occurred: {e}. Reconnecting in 10 seconds...")
+                await asyncio.sleep(10)
 
 
 if __name__ == "__main__":
-    # You can change the symbol to any other, e.g., "ethusdt"
     trader = LiveTrader(symbol="btcusdt")
     try:
         asyncio.run(trader.listen())
     except KeyboardInterrupt:
         print("\n🔌 Disconnected by user.")
-    except Exception as e:
-        print(f"\nAn error occurred: {e}")
-
 
