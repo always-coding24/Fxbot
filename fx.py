@@ -387,4 +387,14 @@ class LiveOandaTrader:
 
             except requests.exceptions.RequestException as e:
                 self.state['connection_status'] = 'Connection Lost'
-                self._add_log(f"Connection Error: {
+                self._add_log(f"Connection Error: {e}")
+                self.dashboard.render(self.state)
+                time.sleep(10)
+
+if __name__ == "__main__":
+    trader = LiveOandaTrader(instruments=INSTRUMENTS)
+    try:
+        trader.stream()
+    except KeyboardInterrupt:
+        print(Style.BRIGHT + Fore.YELLOW + "\n\n🔌 Disconnected by user. Goodbye, Israel!")
+
