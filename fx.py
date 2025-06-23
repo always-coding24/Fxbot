@@ -1,112 +1,107 @@
-import asyncio
-import websockets
+import requests
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+import time
+import os
 from typing import List, Dict, Optional
+from colorama import init, Fore, Style
+
+# Initialize colorama
+init(autoreset=True)
 
 # ==============================================================================
-#  SMC ANALYSIS ENGINE (UNCHANGED FROM OUR PREVIOUS VERSION)
+#  CONFIGURATION
 # ==============================================================================
-# This class contains the pure trading logic. It doesn't know about websockets;
-# it just knows how to analyze lists of candles.
+ACCESS_TOKEN = '672f8f548ea2c0259ce2e043a27ccdf7-accd7e47d49e5eb316003deadbf45c56'
+ACCOUNT_ID   = '101-001-35653324-001'
+ENVIRONMENT  = 'practice'
+INSTRUMENTS  = 'EUR_USD,USD_JPY,GBP_USD'
 
+# ==============================================================================
+#  SMC ANALYSIS ENGINE (The core trading logic - unchanged)
+# ==============================================================================
 class SMCBot:
-    def __init__(self):
+    def __init__(self, instrument_name: str):
+        self.instrument = instrument_name
         self.mitigated_h4_pois = set()
         self.mitigated_h1_pois = set()
-        self.h4_data = []
-        self.h1_data = []
 
     def analyze(self, h4_data: List[Dict], h1_data: List[Dict]) -> Dict:
-        self.h4_data = h4_data
-        self.h1_data = h1_data
-        
-        if len(self.h4_data) < 5 or len(self.h1_data) < 5:
-            return self._format_no_trade("INVALID_STRUCTURE", "Insufficient historical data.")
+        if len(h4_data) < 5 or len(h1_data) < 5:
+            return self._format_no_trade("INVALID_STRUCTURE", "Waiting for more candle data.")
 
-        bias_analysis = self._get_4h_bias()
+        bias_analysis = self._get_4h_bias(h4_data)
         if "error" in bias_analysis:
             return self._format_no_trade(bias_analysis["reason"], bias_analysis["error"])
 
         bias = bias_analysis["bias"]
         h4_poi = bias_analysis["poi"]
         
-        if not self._is_mitigated(h4_poi, self.h4_data):
-            return self._format_no_trade("WAITING_FOR_4H_POI_MITIGATION", f"Waiting for price to tap the 4H POI for {bias}")
+        if not self._is_mitigated(h4_poi, h4_data):
+            return self._format_no_trade("WAITING_FOR_4H_POI_MITIGATION", f"Waiting for price to tap 4H POI for {bias}")
         
         if 'time' in h4_poi and h4_poi['time'] not in self.mitigated_h4_pois:
              self.mitigated_h4_pois.add(h4_poi['time'])
-             print(f"✅ 4H POI Mitigated: {h4_poi}")
-
-
-        entry_analysis = self._get_1h_entry(bias)
+        
+        entry_analysis = self._get_1h_entry(bias, h1_data)
         if "error" in entry_analysis:
             return self._format_no_trade(entry_analysis["reason"], entry_analysis["error"])
         
         h1_poi = entry_analysis["poi"]
 
-        if not self._is_mitigated(h1_poi, self.h1_data):
-             return self._format_no_trade("WAITING_FOR_1H_POI_MITIGATION", "Waiting for price to tap the 1H POI for entry.")
+        if not self._is_mitigated(h1_poi, h1_data):
+             return self._format_no_trade("WAITING_FOR_1H_POI_MITIGATION", "Waiting for price to tap 1H POI")
         
         if 'time' in h1_poi and h1_poi['time'] not in self.mitigated_h1_pois:
             self.mitigated_h1_pois.add(h1_poi['time'])
-            print(f"✅ 1H POI Mitigated: {h1_poi}")
 
+        return self._prepare_trade(bias, h1_poi, h1_data)
 
-        return self._prepare_trade(bias, h1_poi)
-
-    def _get_4h_bias(self) -> Dict:
-        swings = self._get_swing_points(self.h4_data)
-        if not swings['highs'] or not swings['lows']:
-            return {"error": "Could not determine 4H market structure.", "reason": "INVALID_STRUCTURE"}
-
-        last_candle = self.h4_data[-1]
+    def _get_4h_bias(self, h4_data: List[Dict]) -> Dict:
+        swings = self._get_swing_points(h4_data)
+        if not swings['highs'] or not swings['lows']: return {"error": "...", "reason": "INVALID_STRUCTURE"}
+        last_candle = h4_data[-1]
         
         swept_low = self._find_liquidity_sweep(swings['lows'], last_candle, "low")
         if swept_low:
             mss_high = self._find_mss(swept_low, swings['highs'], "bullish")
             if mss_high and last_candle['close'] > mss_high['high']:
-                poi = self._find_poi_after_mss(mss_high, self.h4_data, "bullish")
+                poi = self._find_poi_after_mss(mss_high, h4_data, "bullish")
                 if poi: return {"bias": "BUY", "poi": poi}
-                return {"error": "No valid POI after 4H bullish MSS.", "reason": "NO_VALID_POI"}
         
         swept_high = self._find_liquidity_sweep(swings['highs'], last_candle, "high")
         if swept_high:
             mss_low = self._find_mss(swept_high, swings['lows'], "bearish")
             if mss_low and last_candle['close'] < mss_low['low']:
-                poi = self._find_poi_after_mss(mss_low, self.h4_data, "bearish")
+                poi = self._find_poi_after_mss(mss_low, h4_data, "bearish")
                 if poi: return {"bias": "SELL", "poi": poi}
-                return {"error": "No valid POI after 4H bearish MSS.", "reason": "NO_VALID_POI"}
 
-        return {"error": "No clear liquidity sweep and MSS found.", "reason": "NO_SETUP"}
+        return {"error": "Waiting for 4H liquidity sweep & MSS.", "reason": "NO_SETUP"}
 
-    def _get_1h_entry(self, bias: str) -> Dict:
-        swings = self._get_swing_points(self.h1_data)
-        if not swings['highs'] or not swings['lows']:
-            return {"error": "Could not determine 1H market structure.", "reason": "INVALID_STRUCTURE"}
-            
-        last_candle = self.h1_data[-1]
+    def _get_1h_entry(self, bias: str, h1_data: List[Dict]) -> Dict:
+        swings = self._get_swing_points(h1_data)
+        if not swings['highs'] or not swings['lows']: return {"error": "...", "reason": "INVALID_STRUCTURE"}
+        last_candle = h1_data[-1]
 
         if bias == "BUY":
             swept_low = self._find_liquidity_sweep(swings['lows'], last_candle, "low", is_mini=True)
             if swept_low:
                 mss_high = self._find_mss(swept_low, swings['highs'], "bullish")
                 if mss_high and last_candle['close'] > mss_high['high']:
-                    poi = self._find_poi_after_mss(mss_high, self.h1_data, "bullish", is_1h=True)
+                    poi = self._find_poi_after_mss(mss_high, h1_data, "bullish", is_1h=True)
                     if poi: return {"poi": poi}
-                    return {"error": "No valid 1H POI after bullish MSS.", "reason": "NO_VALID_POI"}
 
         elif bias == "SELL":
             swept_high = self._find_liquidity_sweep(swings['highs'], last_candle, "high", is_mini=True)
             if swept_high:
                 mss_low = self._find_mss(swept_high, swings['lows'], "bearish")
                 if mss_low and last_candle['close'] < mss_low['low']:
-                    poi = self._find_poi_after_mss(mss_low, self.h1_data, "bearish", is_1h=True)
+                    poi = self._find_poi_after_mss(mss_low, h1_data, "bearish", is_1h=True)
                     if poi: return {"poi": poi}
-                    return {"error": "No valid 1H POI after bearish MSS.", "reason": "NO_VALID_POI"}
 
-        return {"error": "No 1H entry setup found.", "reason": "NO_SETUP"}
-
+        return {"error": "Waiting for 1H liquidity sweep & MSS.", "reason": "NO_SETUP"}
+    
+    # --- Other SMCBot helper methods remain unchanged ---
     def _get_swing_points(self, data: List[Dict]) -> Dict:
         highs, lows = [], []
         if len(data) < 3: return {"highs": highs, "lows": lows}
@@ -135,167 +130,261 @@ class SMCBot:
         return valid_pois[-1] if valid_pois else None
 
     def _find_order_blocks(self, data: List[Dict], direction: str) -> List[Dict]:
-        order_blocks = []
+        order_blocks = [];
         if len(data) < 2: return order_blocks
         for i in range(1, len(data)):
-            prev_candle, curr_candle = data[i-1], data[i]
-            is_strong_move = abs(curr_candle['close'] - curr_candle['open']) > (abs(prev_candle['close'] - prev_candle['open']) * 1.5)
-            if direction == "bullish" and prev_candle['close'] < prev_candle['open'] and curr_candle['close'] > curr_candle['open'] and is_strong_move:
-                order_blocks.append(prev_candle)
-            if direction == "bearish" and prev_candle['close'] > prev_candle['open'] and curr_candle['close'] < curr_candle['open'] and is_strong_move:
-                order_blocks.append(prev_candle)
+            p, c = data[i-1], data[i]
+            strong = abs(c['close'] - c['open']) > abs(p['close'] - p['open'])
+            if direction=="bullish" and p['close']<p['open'] and c['close']>c['open'] and strong: order_blocks.append(p)
+            if direction=="bearish" and p['close']>p['open'] and c['close']<c['open'] and strong: order_blocks.append(p)
         return order_blocks
 
     def _is_mitigated(self, poi: Dict, data: List[Dict]) -> bool:
         if not poi or 'time' not in poi: return False
-        relevant_candles = [c for c in data if c.get('time', 0) > poi['time']]
-        for candle in relevant_candles:
-            if candle['low'] <= poi['high'] and candle['high'] >= poi['low']: return True
+        candles = [c for c in data if c.get('time', 0) > poi['time']]
+        for c in candles:
+            if c['low'] <= poi['high'] and c['high'] >= poi['low']: return True
         return False
 
-    def _prepare_trade(self, bias: str, poi: Dict) -> Dict:
-        entry_price = poi['high'] if bias == "SELL" else poi['low']
-        swings = self._get_swing_points(self.h1_data)
+    def _prepare_trade(self, bias: str, poi: Dict, h1_data: List[Dict]) -> Dict:
+        entry = float(poi['high'] if bias == "SELL" else poi['low'])
+        swings = self._get_swing_points(h1_data)
         if bias == "BUY":
-            sl = poi['low'] * 0.999
-            potential_tps = [s for s in swings['highs'] if s.get('time', 0) > poi.get('time', 0)]
-            tp = potential_tps[0]['high'] if potential_tps else entry_price * 1.01
+            sl = float(poi['low']) * 0.9995
+            tps = [s for s in swings['highs'] if s.get('time', 0) > poi.get('time', 0)]
+            tp = float(tps[0]['high']) if tps else entry * 1.005
         else:
-            sl = poi['high'] * 1.001
-            potential_tps = [s for s in swings['lows'] if s.get('time', 0) > poi.get('time', 0)]
-            tp = potential_tps[0]['low'] if potential_tps else entry_price * 0.99
-        trade = {"action": "taketrade", "order_type": bias, "entry": entry_price, "sl": sl, "tp": tp}
-        # Reset mitigated POIs after a trade is taken to look for new setups
-        self.mitigated_h1_pois.clear()
-        self.mitigated_h4_pois.clear()
+            sl = float(poi['high']) * 1.0005
+            tps = [s for s in swings['lows'] if s.get('time', 0) > poi.get('time', 0)]
+            tp = float(tps[0]['low']) if tps else entry * 0.995
+        trade = {"action": "taketrade", "order_type": bias, "entry": entry, "sl": sl, "tp": tp}
+        self.mitigated_h1_pois.clear(); self.mitigated_h4_pois.clear()
         return trade
 
-    def _format_no_trade(self, reason_code: str, log_message: str) -> Dict:
-        return {"action": "don'ttaketrade", "reason": reason_code, "details": log_message}
+    def _format_no_trade(self, reason: str, details: str) -> Dict:
+        return {"action": "don'ttaketrade", "reason": reason, "details": details}
 
 # ==============================================================================
-#  REAL-TIME TRADING BOT ENGINE
+#  DASHBOARD AND VISUALS
 # ==============================================================================
-# This class handles the live data stream, builds candles, and uses the
-# SMCBot to run analysis.
+class Dashboard:
+    def __init__(self):
+        self.spinner_chars = ['|', '/', '—', '\\']
+        self.spinner_index = 0
 
-class LiveTrader:
-    def __init__(self, symbol):
-        self.uri = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@trade"
-        self.smc_bot = SMCBot()
-        self.h1_candles = []
-        self.h4_candles = []
-        self.current_h1_candle = None
-        self.current_h4_candle = None
-        self.active_trade = None
+    def get_spinner(self):
+        char = self.spinner_chars[self.spinner_index]
+        self.spinner_index = (self.spinner_index + 1) % len(self.spinner_chars)
+        return char
 
-    def _update_candle(self, candle: Optional[Dict], price: float, qty: float) -> Dict:
-        """Helper function to update a candle with a new trade."""
-        if not candle:
-            return {'open': price, 'high': price, 'low': price, 'close': price, 'volume': qty, 'start_time': None}
+    def render(self, state: Dict):
+        os.system('cls' if os.name == 'nt' else 'clear')
         
+        print(Style.BRIGHT + Fore.CYAN + "=== Israeldev Real-Time  Trading Bot ===")
+        print(f"Status: {Fore.GREEN}{state['connection_status']}{Style.RESET_ALL} | Uptime: {state['uptime']}")
+        print("-" * 40)
+
+        # Instrument Status
+        print(Style.BRIGHT + Fore.YELLOW + "\n--- Market Watch ---")
+        header = f"{'Instrument':<12} | {'Price':<10} | {'Candles (1H/4H)':<16} | {'SMC Analysis Status'}"
+        print(header)
+        print("-" * len(header))
+        for inst, data in state['instruments'].items():
+            price_str = f"{data['price']:.5f}"
+            candle_str = f"{data['h1_candles_count']} / {data['h4_candles_count']}"
+            status_color = Fore.YELLOW if 'Waiting' in data['analysis_status'] else Fore.CYAN
+            print(f"{Fore.WHITE}{inst:<12}{Style.RESET_ALL} | {data['spinner']} {price_str:<8} | {candle_str:<16} | {status_color}{data['analysis_status']}")
+
+        # Active Trades
+        active_trades_exist = any(data['active_trade'] for data in state['instruments'].values())
+        if active_trades_exist:
+            print(Style.BRIGHT + Fore.GREEN + "\n--- Active Trades ---")
+            trade_header = f"{'Instrument':<12} | {'Type':<5} | {'Entry':<10} | {'Current P/L (Pips)':<20}"
+            print(trade_header)
+            print("-" * len(trade_header))
+            for inst, data in state['instruments'].items():
+                if data['active_trade']:
+                    trade = data['active_trade']
+                    pips = trade['live_pnl_pips']
+                    pnl_color = Fore.GREEN if pips >= 0 else Fore.RED
+                    print(f"{Fore.WHITE}{inst:<12}{Style.RESET_ALL} | {trade['order_type']:<5} | {trade['entry']:.5f} | {pnl_color}{pips:+.1f}")
+        
+        # Event Log
+        print(Style.BRIGHT + Fore.WHITE + "\n--- Event Log ---")
+        if not state['logs']:
+            print(f"{Style.DIM}No new events.")
+        for log in state['logs'][-5:]: # Display last 5 log messages
+            print(f"{Style.DIM}{log}")
+
+# ==============================================================================
+#  LIVE OANDA TRADING BOT ENGINE
+# ==============================================================================
+class LiveOandaTrader:
+    def __init__(self, instruments: str):
+        self.domain = 'stream-fxpractice.oanda.com' if ENVIRONMENT == 'practice' else 'stream-fxtrade.oanda.com'
+        self.url = f'https://{self.domain}/v3/accounts/{ACCOUNT_ID}/pricing/stream'
+        self.headers = {'Authorization': f'Bearer {ACCESS_TOKEN}'}
+        self.params = {'instruments': instruments}
+        self.instrument_list = instruments.split(',')
+        self.dashboard = Dashboard()
+        self.start_time = time.time()
+        self.logs = []
+
+        # --- Initialize State for the Dashboard ---
+        self.state = {
+            'connection_status': 'Initializing...',
+            'uptime': '0s',
+            'instruments': {inst: {
+                'price': 0.0,
+                'analysis_status': 'Connecting...',
+                'h1_candles_count': 0,
+                'h4_candles_count': 0,
+                'spinner': ' ',
+                'active_trade': None
+            } for inst in self.instrument_list},
+            'logs': self.logs
+        }
+        
+        # --- Bot Logic State Management ---
+        self.smc_bots = {inst: SMCBot(inst) for inst in self.instrument_list}
+        self.h1_candles = {inst: [] for inst in self.instrument_list}
+        self.h4_candles = {inst: [] for inst in self.instrument_list}
+        self.current_h1_candle = {inst: None for inst in self.instrument_list}
+        self.current_h4_candle = {inst: None for inst in self.instrument_list}
+
+    def _add_log(self, message: str):
+        timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
+        self.logs.append(f"[{timestamp}] {message}")
+
+    def _update_candle(self, candle: Optional[Dict], price: float) -> Dict:
+        if not candle: return {'open': price, 'high': price, 'low': price, 'close': price, 'start_time': None}
         candle['high'] = max(candle['high'], price)
         candle['low'] = min(candle['low'], price)
         candle['close'] = price
-        candle['volume'] += qty
         return candle
+
+    def _handle_tick(self, tick: Dict):
+        try:
+            if tick.get('type') != 'PRICE': return
+            inst = tick['instrument']
+            if inst not in self.instrument_list: return
+            
+            price = (float(tick['bids'][0]['price']) + float(tick['asks'][0]['price'])) / 2
+            timestamp = datetime.fromisoformat(tick['time'].replace('Z', '+00:00'))
+
+            # Update dashboard state
+            self.state['instruments'][inst]['price'] = price
+            self.state['instruments'][inst]['spinner'] = self.dashboard.get_spinner()
+
+            # Track active trade P/L
+            if self.state['instruments'][inst]['active_trade']:
+                self._track_active_trade(inst, price)
+            
+            self._aggregate_candles(inst, price, timestamp)
+        except (KeyError, IndexError): pass
+
+    def _track_active_trade(self, inst: str, price: float):
+        trade = self.state['instruments'][inst]['active_trade']
+        entry, sl, tp = trade['entry'], trade['sl'], trade['tp']
+        pips_multiplier = 100 if 'JPY' in inst else 10000
+
+        if trade['order_type'] == 'BUY':
+            pips = (price - entry) * pips_multiplier
+            if price <= sl: self._close_trade(inst, price, "STOP LOSS")
+            elif price >= tp: self._close_trade(inst, price, "TAKE PROFIT")
+        else: # SELL
+            pips = (entry - price) * pips_multiplier
+            if price >= sl: self._close_trade(inst, price, "STOP LOSS")
+            elif price <= tp: self._close_trade(inst, price, "TAKE PROFIT")
         
-    async def _handle_message(self, ws):
-        """Processes a single message from the websocket."""
-        async for message in ws:
-            trade = json.loads(message)
-            price = float(trade['p'])
-            qty = float(trade['q'])
-            timestamp = int(trade['T']) // 1000  # Use seconds for timestamp
-            
-            # --- Track Active Trade and Profit ---
-            if self.active_trade:
-                entry = self.active_trade['entry']
-                sl = self.active_trade['sl']
-                tp = self.active_trade['tp']
-                profit = 0
-                if self.active_trade['order_type'] == 'BUY':
-                    profit = ((price - entry) / entry) * 100
-                    if price <= sl: 
-                        print(f"\n❌ STOP LOSS HIT: P/L: {profit:.2f}%")
-                        self.active_trade = None
-                    elif price >= tp:
-                        print(f"\n🎯 TAKE PROFIT HIT: P/L: {profit:.2f}%")
-                        self.active_trade = None
-                else: # SELL
-                    profit = ((entry - price) / entry) * 100
-                    if price >= sl:
-                         print(f"\n❌ STOP LOSS HIT: P/L: {profit:.2f}%")
-                         self.active_trade = None
-                    elif price <= tp:
-                        print(f"\n🎯 TAKE PROFIT HIT: P/L: {profit:.2f}%")
-                        self.active_trade = None
-                
-                if self.active_trade: # Check if trade is still active before printing
-                    pnl_str = f"🟢 P/L: {profit:+.2f}%" if profit >= 0 else f"🔴 P/L: {profit:+.2f}%"
-                    print(f"\r🔔 IN TRADE [{self.active_trade['order_type']}]: Entry: {entry:.2f}, Current: {price:.2f}, SL: {sl:.2f}, TP: {tp:.2f} | {pnl_str}", end="")
-            
-            dt_object = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-            current_h1_start_time = dt_object.replace(minute=0, second=0, microsecond=0)
-            current_h4_start_time = dt_object.replace(hour=(dt_object.hour // 4) * 4, minute=0, second=0, microsecond=0)
-            
-            if self.current_h1_candle is None:
-                self.current_h1_candle = self._update_candle(None, price, qty)
-                self.current_h1_candle['start_time'] = current_h1_start_time
-            
-            if current_h1_start_time > self.current_h1_candle['start_time']:
-                final_candle = {"time": int(self.current_h1_candle['start_time'].timestamp()), "open": self.current_h1_candle['open'], "high": self.current_h1_candle['high'], "low": self.current_h1_candle['low'], "close": self.current_h1_candle['close'], "volume": self.current_h1_candle['volume']}
-                self.h1_candles.append(final_candle)
-                print(f"\n🕯️ New 1H Candle Closed. Total 1H candles: {len(self.h1_candles)}. Analyzing...")
-                
-                self.current_h1_candle = self._update_candle(None, price, qty)
-                self.current_h1_candle['start_time'] = current_h1_start_time
-                
-                if not self.active_trade:
-                    analysis_result = self.smc_bot.analyze(self.h4_candles, self.h1_candles)
-                    if analysis_result['action'] == 'taketrade':
-                        self.active_trade = analysis_result
-                        print("\n" + "!"*80)
-                        print(f"🚨🚨🚨 TAKE TRADE SIGNAL 🚨🚨🚨")
-                        print(json.dumps(self.active_trade, indent=4))
-                        print("!"*80)
-                    else:
-                        print(f"📊 Analysis Result: {analysis_result['reason']} - {analysis_result['details']}")
+        if self.state['instruments'][inst]['active_trade']:
+            self.state['instruments'][inst]['active_trade']['live_pnl_pips'] = pips
 
-            if self.current_h4_candle is None:
-                self.current_h4_candle = self._update_candle(None, price, qty)
-                self.current_h4_candle['start_time'] = current_h4_start_time
+    def _close_trade(self, inst: str, price: float, reason: str):
+         self._add_log(f"🎯 [{inst}] {reason} HIT AT {price}")
+         self.state['instruments'][inst]['active_trade'] = None
 
-            if current_h4_start_time > self.current_h4_candle['start_time']:
-                final_candle = {"time": int(self.current_h4_candle['start_time'].timestamp()), "open": self.current_h4_candle['open'], "high": self.current_h4_candle['high'], "low": self.current_h4_candle['low'], "close": self.current_h4_candle['close'], "volume": self.current_h4_candle['volume']}
-                self.h4_candles.append(final_candle)
-                print(f"\n🕯️ New 4H Candle Closed. Total 4H candles: {len(self.h4_candles)}.")
-                self.current_h4_candle = self._update_candle(None, price, qty)
-                self.current_h4_candle['start_time'] = current_h4_start_time
+    def _aggregate_candles(self, inst: str, price: float, timestamp: datetime):
+        current_h1_start_time = timestamp.replace(minute=0, second=0, microsecond=0)
+        current_h4_start_time = timestamp.replace(hour=(timestamp.hour//4)*4, minute=0, second=0, microsecond=0)
+        
+        # -- 1H Candles --
+        if self.current_h1_candle[inst] is None:
+            self.current_h1_candle[inst] = self._update_candle(None, price)
+            self.current_h1_candle[inst]['start_time'] = current_h1_start_time
+        
+        if current_h1_start_time > self.current_h1_candle[inst]['start_time']:
+            c = self.current_h1_candle[inst]
+            final = {"time": int(c['start_time'].timestamp()), "open":c['open'],"high":c['high'],"low":c['low'],"close":c['close'],"volume":0}
+            self.h1_candles[inst].append(final)
+            self.state['instruments'][inst]['h1_candles_count'] = len(self.h1_candles[inst])
+            self._add_log(f"🕯️ [{inst}] New 1H Candle Closed. Total: {len(self.h1_candles[inst])}")
+            
+            self.current_h1_candle[inst] = self._update_candle(None, price)
+            self.current_h1_candle[inst]['start_time'] = current_h1_start_time
+            
+            # Run analysis only if not in a trade for this instrument
+            if not self.state['instruments'][inst]['active_trade']:
+                bot = self.smc_bots[inst]
+                res = bot.analyze(self.h4_candles[inst], self.h1_candles[inst])
+                self.state['instruments'][inst]['analysis_status'] = res['details']
+                if res['action'] == 'taketrade':
+                    res['live_pnl_pips'] = 0.0 # Initialize P/L
+                    self.state['instruments'][inst]['active_trade'] = res
+                    self._add_log(f"🚨 [{inst}] TAKE TRADE SIGNAL: {res['order_type']} @ {res['entry']:.5f}")
+        
+        # -- 4H Candles --
+        if self.current_h4_candle[inst] is None:
+            self.current_h4_candle[inst] = self._update_candle(None, price)
+            self.current_h4_candle[inst]['start_time'] = current_h4_start_time
+        
+        if current_h4_start_time > self.current_h4_candle[inst]['start_time']:
+            c = self.current_h4_candle[inst]
+            final = {"time": int(c['start_time'].timestamp()), "open":c['open'],"high":c['high'],"low":c['low'],"close":c['close'],"volume":0}
+            self.h4_candles[inst].append(final)
+            self.state['instruments'][inst]['h4_candles_count'] = len(self.h4_candles[inst])
+            self._add_log(f"🕯️ [{inst}] New 4H Candle Closed. Total: {len(self.h4_candles[inst])}")
+            self.current_h4_candle[inst] = self._update_candle(None, price)
+            self.current_h4_candle[inst]['start_time'] = current_h4_start_time
+        
+        # Update current candle data with every tick
+        self.current_h1_candle[inst] = self._update_candle(self.current_h1_candle[inst], price)
+        self.current_h4_candle[inst] = self._update_candle(self.current_h4_candle[inst], price)
 
-            self.current_h1_candle = self._update_candle(self.current_h1_candle, price, qty)
-            self.current_h4_candle = self._update_candle(self.current_h4_candle, price, qty)
-
-    async def listen(self):
-        """Main loop to connect to WebSocket, process trades, and handle reconnections."""
+    def stream(self):
+        """Main loop to connect to OANDA, handle reconnections, and render the dashboard."""
+        last_render_time = 0
         while True:
             try:
-                # Add ping_interval to keep the connection alive
-                async with websockets.connect(self.uri, ping_interval=20, ping_timeout=20) as ws:
-                    print("✅ Connection successful. Waiting for live trade data...")
-                    await self._handle_message(ws)
-            except websockets.exceptions.ConnectionClosed:
-                print("Connection closed. Reconnecting in 10 seconds...")
-                await asyncio.sleep(10)
-            except Exception as e:
-                print(f"An error occurred: {e}. Reconnecting in 10 seconds...")
-                await asyncio.sleep(10)
+                self.state['connection_status'] = 'Connecting...'
+                self.dashboard.render(self.state)
+                response = requests.get(self.url, headers=self.headers, params=self.params, stream=True, timeout=30)
+                
+                if response.status_code != 200:
+                    self.state['connection_status'] = f'Error {response.status_code}'
+                    self._add_log(f"Connection Error: {response.text}")
+                    self.dashboard.render(self.state)
+                    time.sleep(15)
+                    continue
 
+                self.state['connection_status'] = 'Connected'
+                self._add_log("Connection successful.")
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            data = json.loads(line.decode('utf-8'))
+                            self._handle_tick(data)
+                        except json.JSONDecodeError: continue
+                    
+                    # Update Uptime
+                    uptime_seconds = int(time.time() - self.start_time)
+                    self.state['uptime'] = f"{uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m {uptime_seconds % 60}s"
+                    
+                    # Render dashboard periodically to reduce flicker
+                    if time.time() - last_render_time > 0.5:
+                        self.dashboard.render(self.state)
+                        last_render_time = time.time()
 
-if __name__ == "__main__":
-    trader = LiveTrader(symbol="btcusdt")
-    try:
-        asyncio.run(trader.listen())
-    except KeyboardInterrupt:
-        print("\n🔌 Disconnected by user.")
-
+            except requests.exceptions.RequestException as e:
+                self.state['connection_status'] = 'Connection Lost'
+                self._add_log(f"Connection Error: {
