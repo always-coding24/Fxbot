@@ -180,7 +180,9 @@ class Dashboard:
     def render(self, state: Dict):
         os.system('cls' if os.name == 'nt' else 'clear')
         
-        print(Style.BRIGHT + Fore.CYAN + "=== OANDA Real-Time SMC Trading Bot ===")
+        print(Style.BRIGHT + Fore.CYAN + "=== Israel devReal-Time Trading Bot
+cred:fumcy❤️
+ ===")
         print(f"Status: {Fore.GREEN}{state['connection_status']}{Style.RESET_ALL} | Uptime: {state['uptime']} | Max Risk: ${RISK_PER_TRADE_USD}")
         print("-" * 60)
 
